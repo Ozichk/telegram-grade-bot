@@ -5,25 +5,45 @@ import threading
 from collections import Counter
 from typing import Dict, List, Tuple, Any, Optional
 
+import requests
 import telebot
+import telebot.apihelper as apihelper
 from telebot import types
 from openpyxl import load_workbook
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask
 
-# ====== НАСТРОЙКИ ======
+# ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing in environment variables")
 
 DATA_FILE = "users.json"
 DEFAULT_TZ = "Europe/Berlin"
-SEP = "||"  # разделитель для ключей Counter (чтобы JSON мог сохранить)
+SEP = "||"  # разделитель для ключей Counter, чтобы JSON мог сохранить
+HISTORY_LIMIT = 60  # сколько снимков хранить
+PORT_DEFAULT = "10000"
+
+# Telegram timeouts (чтобы меньше отваливалось)
+apihelper.CONNECT_TIMEOUT = 10
+apihelper.READ_TIMEOUT = 30
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ====== Flask (порт-заглушка для Render Web Service) ======
+# ================== safe_send: чтобы бот не падал при сбое сети ==================
+def safe_send(chat_id: int, text: str, reply_markup=None, tries: int = 3):
+    for i in range(tries):
+        try:
+            return bot.send_message(chat_id, text, reply_markup=reply_markup)
+        except (requests.exceptions.RequestException, ConnectionError):
+            time.sleep(2 + i * 2)
+        except Exception:
+            time.sleep(1)
+    return None
+
+
+# ================== Flask (порт-заглушка для Render Web Service) ==================
 app = Flask(__name__)
 
 @app.get("/")
@@ -31,17 +51,17 @@ def home():
     return "OK", 200
 
 def run_web():
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT", PORT_DEFAULT))
     app.run(host="0.0.0.0", port=port)
 
 threading.Thread(target=run_web, daemon=True).start()
 
-# ====== Scheduler ======
+# ================== Scheduler ==================
 scheduler = BackgroundScheduler(timezone=DEFAULT_TZ)
 scheduler.start()
 scheduled_jobs: Dict[int, str] = {}
 
-# ----------------- Хранилище -----------------
+# ================== Хранилище ==================
 def load_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
         return {}
@@ -68,13 +88,28 @@ def get_user(chat_id: int) -> Dict[str, Any]:
             "reminder_enabled": False,
             "reminder_time": None,
             "awaiting_time": False,
+            "history": [],             # список снимков: ts, overall, averages
         }
         data[str(chat_id)] = u
         save_data(data)
+    else:
+        # совместимость
+        u.setdefault("grades_counter", {})
+        u.setdefault("last_overall", None)
+        u.setdefault("last_averages", {})
+        u.setdefault("reminder_enabled", False)
+        u.setdefault("reminder_time", None)
+        u.setdefault("awaiting_time", False)
+        u.setdefault("history", [])
     return u
 
-# ----------------- Excel -> оценки -----------------
+
+# ================== Excel -> оценки ==================
 def parse_excel_grades(file_path: str) -> List[Tuple[str, int]]:
+    """
+    col0 = предмет, дальше оценки и 'Н'. Берём только числа.
+    Возвращаем список (предмет, оценка).
+    """
     wb = load_workbook(file_path)
     sheet = wb.active
 
@@ -107,8 +142,12 @@ def analyze_items(items: List[Tuple[str, int]]) -> Optional[Dict[str, Any]]:
 
     return {"overall": overall, "best": best, "worst": worst, "averages": averages}
 
-# ----------------- Counter, который можно сохранить в JSON -----------------
+
+# ================== Counter (JSON-safe) ==================
 def make_counter(items: List[Tuple[str, int]]) -> Counter:
+    """
+    Храним ключами строки: "Предмет||5" -> количество.
+    """
     c = Counter()
     for subj, grade in items:
         c[f"{subj}{SEP}{grade}"] += 1
@@ -119,6 +158,9 @@ def parse_counter_key(key: str) -> Tuple[str, int]:
     return subj, int(grade)
 
 def diff_new_grades(old: Counter, new: Counter) -> List[Tuple[str, int, int]]:
+    """
+    (предмет, оценка, сколько раз добавилось)
+    """
     added = []
     for key, new_count in new.items():
         old_count = old.get(key, 0)
@@ -128,7 +170,8 @@ def diff_new_grades(old: Counter, new: Counter) -> List[Tuple[str, int, int]]:
     added.sort(key=lambda x: (x[0], x[1]))
     return added
 
-# ----------------- UI: inline кнопки -----------------
+
+# ================== UI: inline кнопки ==================
 def menu_kb() -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -136,16 +179,16 @@ def menu_kb() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("📚 Подробный отчёт", callback_data="details"),
     )
     kb.add(
+        types.InlineKeyboardButton("📈 Динамика", callback_data="trend"),
         types.InlineKeyboardButton("🔄 Обновить данные", callback_data="refresh"),
-        types.InlineKeyboardButton("⏰ Напоминания", callback_data="reminders"),
     )
+    kb.add(types.InlineKeyboardButton("⏰ Напоминания", callback_data="reminders"))
     return kb
 
 def reminders_kb(enabled: bool) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
     toggle_text = "⛔ Выкл напоминания" if enabled else "✅ Вкл напоминания"
     kb.add(types.InlineKeyboardButton(toggle_text, callback_data="rem_toggle"))
-
     kb.add(
         types.InlineKeyboardButton("08:00", callback_data="time_08:00"),
         types.InlineKeyboardButton("12:00", callback_data="time_12:00"),
@@ -156,9 +199,30 @@ def reminders_kb(enabled: bool) -> types.InlineKeyboardMarkup:
     kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back"))
     return kb
 
-# ----------------- Напоминания -----------------
+def subjects_kb(subjects: List[str], page: int = 0, per_page: int = 8) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    subjects_sorted = sorted(subjects)
+    start = page * per_page
+    chunk = subjects_sorted[start:start + per_page]
+
+    for s in chunk:
+        kb.add(types.InlineKeyboardButton(s, callback_data=f"subj:{s}"))
+
+    nav = []
+    if page > 0:
+        nav.append(types.InlineKeyboardButton("⬅️", callback_data=f"subjpage:{page-1}"))
+    if start + per_page < len(subjects_sorted):
+        nav.append(types.InlineKeyboardButton("➡️", callback_data=f"subjpage:{page+1}"))
+    if nav:
+        kb.row(*nav)
+
+    kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="trend"))
+    return kb
+
+
+# ================== Напоминания ==================
 def reminder_job(chat_id: int):
-    bot.send_message(chat_id, "⏰ Пора обновить оценки: отправь свежий Excel-файл (.xlsx).")
+    safe_send(chat_id, "⏰ Пора обновить оценки: отправь свежий Excel-файл (.xlsx).")
 
 def schedule_user_reminder(chat_id: int, hhmm: str):
     old_job_id = scheduled_jobs.get(chat_id)
@@ -202,28 +266,34 @@ def restore_jobs_from_file():
 
 restore_jobs_from_file()
 
-# ----------------- Команды -----------------
+
+# ================== Команды ==================
 @bot.message_handler(commands=["start"])
 def start(message):
     get_user(message.chat.id)
-    bot.send_message(
+    safe_send(
         message.chat.id,
         "Привет! 👋\n"
         "Отправь Excel (.xlsx) с оценками — я сделаю анализ.\n"
-        "Дальше управляй через кнопки.",
+        "Управляй через кнопки ниже.",
         reply_markup=menu_kb()
     )
 
-# ----------------- Приём файла -----------------
+
+# ================== Приём файла ==================
 @bot.message_handler(content_types=["document"])
 def on_document(message):
     file_name = message.document.file_name or ""
     if not file_name.lower().endswith(".xlsx"):
-        bot.send_message(message.chat.id, "Нужен файл формата .xlsx 🙂", reply_markup=menu_kb())
+        safe_send(message.chat.id, "Нужен файл формата .xlsx 🙂", reply_markup=menu_kb())
         return
 
-    file_info = bot.get_file(message.document.file_id)
-    raw = bot.download_file(file_info.file_path)
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        raw = bot.download_file(file_info.file_path)
+    except Exception:
+        safe_send(message.chat.id, "Не получилось скачать файл. Попробуй ещё раз 🙂", reply_markup=menu_kb())
+        return
 
     tmp_name = f"{message.from_user.id}_{int(time.time())}.xlsx"
     with open(tmp_name, "wb") as f:
@@ -233,20 +303,29 @@ def on_document(message):
         items = parse_excel_grades(tmp_name)
         rep = analyze_items(items)
         if not rep:
-            bot.send_message(message.chat.id, "Не нашёл оценок в файле 😔", reply_markup=menu_kb())
+            safe_send(message.chat.id, "Не нашёл оценок в файле 😔", reply_markup=menu_kb())
             return
 
         u = get_user(message.chat.id)
 
-        # старые данные (уже строковые ключи)
         old_counter = Counter(u.get("grades_counter", {}))
         new_counter = make_counter(items)
         added = diff_new_grades(old_counter, new_counter)
 
-        # сохранить
-        u["grades_counter"] = dict(new_counter)  # JSON-совместимо
+        # сохранить новое состояние
+        u["grades_counter"] = dict(new_counter)  # JSON-safe
         u["last_overall"] = rep["overall"]
         u["last_averages"] = rep["averages"]
+
+        # история (снимок)
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        u.setdefault("history", []).append({
+            "ts": stamp,
+            "overall": rep["overall"],
+            "averages": rep["averages"],
+        })
+        u["history"] = u["history"][-HISTORY_LIMIT:]
+
         save_data(data)
 
         msg = "✅ Файл обработан.\n"
@@ -262,7 +341,7 @@ def on_document(message):
         else:
             msg += "\nНовых оценок не обнаружено."
 
-        bot.send_message(message.chat.id, msg, reply_markup=menu_kb())
+        safe_send(message.chat.id, msg, reply_markup=menu_kb())
 
     finally:
         try:
@@ -270,7 +349,8 @@ def on_document(message):
         except Exception:
             pass
 
-# ----------------- Callback кнопок -----------------
+
+# ================== Callback кнопок ==================
 @bot.callback_query_handler(func=lambda call: True)
 def on_callback(call):
     chat_id = call.message.chat.id
@@ -291,7 +371,7 @@ def on_callback(call):
             f"🏆 Лучший предмет: {best}\n"
             f"⚠ Самый слабый предмет: {worst}"
         )
-        bot.send_message(chat_id, text, reply_markup=menu_kb())
+        safe_send(chat_id, text, reply_markup=menu_kb())
         bot.answer_callback_query(call.id)
         return
 
@@ -304,34 +384,48 @@ def on_callback(call):
         lines = ["📚 Отчёт по предметам:"]
         for subj, avg in sorted(averages.items(), key=lambda x: x[0]):
             lines.append(f"• {subj}: {avg:.2f}")
-        bot.send_message(chat_id, "\n".join(lines), reply_markup=menu_kb())
+        safe_send(chat_id, "\n".join(lines), reply_markup=menu_kb())
         bot.answer_callback_query(call.id)
         return
 
     if call.data == "refresh":
-        bot.send_message(chat_id, "🔄 Ок! Пришли новый Excel-файл (.xlsx).", reply_markup=menu_kb())
+        safe_send(chat_id, "🔄 Ок! Пришли новый Excel-файл (.xlsx).", reply_markup=menu_kb())
         bot.answer_callback_query(call.id)
         return
 
     if call.data == "reminders":
         enabled = bool(u.get("reminder_enabled"))
         t = u.get("reminder_time") or "не задано"
-        text = f"⏰ Напоминания\nСтатус: {'включены ✅' if enabled else 'выключены ⛔'}\nВремя: {t}"
-        bot.send_message(chat_id, text, reply_markup=reminders_kb(enabled))
+        text = (
+            "⏰ Напоминания\n"
+            f"Статус: {'включены ✅' if enabled else 'выключены ⛔'}\n"
+            f"Время: {t}\n\n"
+            "Выбери время кнопками или введи своё."
+        )
+        safe_send(chat_id, text, reply_markup=reminders_kb(enabled))
         bot.answer_callback_query(call.id)
         return
 
     if call.data == "rem_toggle":
         u["reminder_enabled"] = not bool(u.get("reminder_enabled"))
+
         if not u["reminder_enabled"]:
             unschedule_user_reminder(chat_id)
-        else:
-            if u.get("reminder_time"):
-                schedule_user_reminder(chat_id, u["reminder_time"])
-        save_data(data)
+            save_data(data)
+            safe_send(chat_id, "⛔ Напоминания выключены.", reply_markup=reminders_kb(False))
+            bot.answer_callback_query(call.id)
+            return
 
-        enabled = bool(u.get("reminder_enabled"))
-        bot.send_message(chat_id, "Готово ✅", reply_markup=reminders_kb(enabled))
+        # включили
+        if not u.get("reminder_time"):
+            save_data(data)
+            safe_send(chat_id, "✅ Включил! Теперь выбери время 👇", reply_markup=reminders_kb(True))
+            bot.answer_callback_query(call.id)
+            return
+
+        schedule_user_reminder(chat_id, u["reminder_time"])
+        save_data(data)
+        safe_send(chat_id, f"✅ Напоминания включены ({u['reminder_time']}).", reply_markup=reminders_kb(True))
         bot.answer_callback_query(call.id)
         return
 
@@ -343,54 +437,133 @@ def on_callback(call):
         save_data(data)
 
         enabled = bool(u.get("reminder_enabled"))
-        bot.send_message(chat_id, f"✅ Время установлено: {hhmm}", reply_markup=reminders_kb(enabled))
+        safe_send(chat_id, f"✅ Время установлено: {hhmm}", reply_markup=reminders_kb(enabled))
         bot.answer_callback_query(call.id)
         return
 
     if call.data == "time_custom":
         u["awaiting_time"] = True
         save_data(data)
-        bot.send_message(chat_id, "Напиши время в формате HH:MM (например 18:30).")
+        safe_send(chat_id, "Напиши время в формате HH:MM (например 18:30).")
+        bot.answer_callback_query(call.id)
+        return
+
+    # ----- ДИНАМИКА -----
+    if call.data == "trend":
+        hist = u.get("history", [])
+        if len(hist) < 2:
+            bot.answer_callback_query(call.id, "Нужно минимум 2 выгрузки Excel 🙂")
+            return
+
+        lines = ["📈 Динамика среднего балла (последние 10):"]
+        for h in hist[-10:]:
+            lines.append(f"• {h['ts']}: {h['overall']:.2f}")
+
+        delta = hist[-1]["overall"] - hist[-2]["overall"]
+        if delta > 0:
+            lines.append(f"\n✅ Стало лучше на +{delta:.2f}")
+        elif delta < 0:
+            lines.append(f"\n⚠️ Стало хуже на {delta:.2f}")
+        else:
+            lines.append("\n➖ Без изменений")
+
+        last_av = u.get("last_averages", {})
+        if last_av:
+            lines.append("\nВыбери предмет для динамики 👇")
+            safe_send(chat_id, "\n".join(lines), reply_markup=subjects_kb(list(last_av.keys()), page=0))
+        else:
+            safe_send(chat_id, "\n".join(lines), reply_markup=menu_kb())
+
+        bot.answer_callback_query(call.id)
+        return
+
+    if call.data.startswith("subjpage:"):
+        last_av = u.get("last_averages", {})
+        if not last_av:
+            bot.answer_callback_query(call.id, "Нет данных. Сначала отправь Excel 🙂")
+            return
+
+        page = int(call.data.split(":", 1)[1])
+        safe_send(chat_id, "Выбери предмет:", reply_markup=subjects_kb(list(last_av.keys()), page=page))
+        bot.answer_callback_query(call.id)
+        return
+
+    if call.data.startswith("subj:"):
+        subject = call.data.split(":", 1)[1]
+        hist = u.get("history", [])
+        if not hist:
+            bot.answer_callback_query(call.id, "Нет истории. Сначала отправь Excel 🙂")
+            return
+
+        points = []
+        for h in hist[-10:]:
+            av = h.get("averages", {}).get(subject)
+            if av is not None:
+                points.append((h["ts"], float(av)))
+
+        if len(points) < 2:
+            safe_send(chat_id, f"По предмету «{subject}» пока мало данных (нужно минимум 2 выгрузки).", reply_markup=menu_kb())
+            bot.answer_callback_query(call.id)
+            return
+
+        lines = [f"📘 Динамика по предмету: {subject} (последние 10)"]
+        for ts, av in points:
+            lines.append(f"• {ts}: {av:.2f}")
+
+        delta = points[-1][1] - points[-2][1]
+        if delta > 0:
+            lines.append(f"\n✅ Улучшение: +{delta:.2f}")
+        elif delta < 0:
+            lines.append(f"\n⚠️ Ухудшение: {delta:.2f}")
+        else:
+            lines.append("\n➖ Без изменений")
+
+        safe_send(chat_id, "\n".join(lines), reply_markup=menu_kb())
         bot.answer_callback_query(call.id)
         return
 
     if call.data == "back":
-        bot.send_message(chat_id, "Меню:", reply_markup=menu_kb())
+        safe_send(chat_id, "Меню:", reply_markup=menu_kb())
         bot.answer_callback_query(call.id)
         return
 
     bot.answer_callback_query(call.id)
 
-# ----------------- Ввод своего времени -----------------
+
+# ================== Ввод своего времени ==================
 @bot.message_handler(content_types=["text"])
 def on_text(message):
     chat_id = message.chat.id
     u = get_user(chat_id)
 
     if u.get("awaiting_time"):
-        txt = (message.text or "").strip()
+        raw = (message.text or "").strip()
         u["awaiting_time"] = False
 
         try:
-            hh, mm = txt.split(":")
-            hh_i, mm_i = int(hh), int(mm)
+            parts = raw.split(":")
+            if len(parts) != 2:
+                raise ValueError
+            hh_i = int(parts[0])
+            mm_i = int(parts[1])
             if not (0 <= hh_i <= 23 and 0 <= mm_i <= 59):
                 raise ValueError
         except Exception:
             save_data(data)
-            bot.send_message(chat_id, "❌ Неправильный формат. Пример: 18:30")
+            safe_send(chat_id, "❌ Неправильный формат. Пример: 18:30")
             return
 
-        u["reminder_time"] = txt
+        hhmm = f"{hh_i:02d}:{mm_i:02d}"
+        u["reminder_time"] = hhmm
         if u.get("reminder_enabled"):
-            schedule_user_reminder(chat_id, txt)
+            schedule_user_reminder(chat_id, hhmm)
 
         save_data(data)
-        bot.send_message(chat_id, f"✅ Время установлено: {txt}", reply_markup=menu_kb())
+        safe_send(chat_id, f"✅ Время установлено: {hhmm}", reply_markup=menu_kb())
         return
 
-    bot.send_message(chat_id, "Выбери действие кнопками 👇", reply_markup=menu_kb())
+    safe_send(chat_id, "Выбери действие кнопками 👇", reply_markup=menu_kb())
+
 
 print("Бот запущен...")
-bot.infinity_polling()
-
+bot.infinity_polling(timeout=20, long_polling_timeout=20)
