@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import threading
 from collections import Counter
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -9,82 +10,86 @@ from telebot import types
 from openpyxl import load_workbook
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-
-import threading
 from flask import Flask
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing in environment variables")
-DATA_FILE = "users.json"          # хранение данных пользователей
-DEFAULT_TZ = "Europe/Berlin"      # тебе подходит (ты в Германии)
+
+DATA_FILE = "users.json"
+DEFAULT_TZ = "Europe/Berlin"
+SEP = "||"  # разделитель для ключей Counter (чтобы JSON мог сохранить)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# scheduler для напоминаний
+# ====== Flask (порт-заглушка для Render Web Service) ======
+app = Flask(__name__)
+
+@app.get("/")
+def home():
+    return "OK", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_web, daemon=True).start()
+
+# ====== Scheduler ======
 scheduler = BackgroundScheduler(timezone=DEFAULT_TZ)
 scheduler.start()
-
-# chat_id -> job_id (в памяти)
 scheduled_jobs: Dict[int, str] = {}
-
 
 # ----------------- Хранилище -----------------
 def load_data() -> Dict[str, Any]:
     if not os.path.exists(DATA_FILE):
         return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # если файл сломан/битый — начинаем заново
+        return {}
 
-
-def save_data(data: Dict[str, Any]) -> None:
+def save_data(d: Dict[str, Any]) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
+        json.dump(d, f, ensure_ascii=False, indent=2)
 
 data = load_data()
-
 
 def get_user(chat_id: int) -> Dict[str, Any]:
     u = data.get(str(chat_id))
     if not u:
         u = {
-            "grades_counter": {},          # Counter в виде dict
+            "grades_counter": {},      # dict со строковыми ключами
             "last_overall": None,
-            "last_averages": {},           # subject -> avg
+            "last_averages": {},
             "reminder_enabled": False,
-            "reminder_time": None,         # "HH:MM"
+            "reminder_time": None,
+            "awaiting_time": False,
         }
         data[str(chat_id)] = u
         save_data(data)
     return u
 
-
 # ----------------- Excel -> оценки -----------------
 def parse_excel_grades(file_path: str) -> List[Tuple[str, int]]:
-    """
-    Таблица как на твоём скрине:
-    col0 = предмет, дальше оценки и 'Н'.
-    Берём только числа.
-    Возвращаем список (предмет, оценка).
-    """
     wb = load_workbook(file_path)
     sheet = wb.active
 
     items: List[Tuple[str, int]] = []
-
     for row in sheet.iter_rows(values_only=True):
         subject = row[0]
         if not subject or not isinstance(subject, str):
             continue
+        subject = subject.strip()
 
         for cell in row[1:]:
             if isinstance(cell, (int, float)):
-                items.append((subject.strip(), int(cell)))
+                items.append((subject, int(cell)))
 
     return items
-
 
 def analyze_items(items: List[Tuple[str, int]]) -> Optional[Dict[str, Any]]:
     if not items:
@@ -100,36 +105,28 @@ def analyze_items(items: List[Tuple[str, int]]) -> Optional[Dict[str, Any]]:
     best = max(averages, key=averages.get)
     worst = min(averages, key=averages.get)
 
-    return {
-        "overall": overall,
-        "best": best,
-        "worst": worst,
-        "averages": averages,
-    }
+    return {"overall": overall, "best": best, "worst": worst, "averages": averages}
 
-
+# ----------------- Counter, который можно сохранить в JSON -----------------
 def make_counter(items: List[Tuple[str, int]]) -> Counter:
-    """
-    Для поиска новых оценок используем мультисет:
-    (предмет, оценка) -> сколько раз встречается
-    """
-    return Counter(items)
+    c = Counter()
+    for subj, grade in items:
+        c[f"{subj}{SEP}{grade}"] += 1
+    return c
 
+def parse_counter_key(key: str) -> Tuple[str, int]:
+    subj, grade = key.split(SEP, 1)
+    return subj, int(grade)
 
 def diff_new_grades(old: Counter, new: Counter) -> List[Tuple[str, int, int]]:
-    """
-    Возвращает список добавлений: (предмет, оценка, сколько_раз_добавилось)
-    """
     added = []
     for key, new_count in new.items():
         old_count = old.get(key, 0)
         if new_count > old_count:
-            subj, grade = key
+            subj, grade = parse_counter_key(key)
             added.append((subj, grade, new_count - old_count))
-    # красивее сортировать
     added.sort(key=lambda x: (x[0], x[1]))
     return added
-
 
 # ----------------- UI: inline кнопки -----------------
 def menu_kb() -> types.InlineKeyboardMarkup:
@@ -144,14 +141,11 @@ def menu_kb() -> types.InlineKeyboardMarkup:
     )
     return kb
 
-
-def reminders_kb(enabled: bool, current_time: Optional[str]) -> types.InlineKeyboardMarkup:
+def reminders_kb(enabled: bool) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=2)
-
     toggle_text = "⛔ Выкл напоминания" if enabled else "✅ Вкл напоминания"
     kb.add(types.InlineKeyboardButton(toggle_text, callback_data="rem_toggle"))
 
-    # выбор времени — пресеты (для 9 класса идеально)
     kb.add(
         types.InlineKeyboardButton("08:00", callback_data="time_08:00"),
         types.InlineKeyboardButton("12:00", callback_data="time_12:00"),
@@ -160,20 +154,13 @@ def reminders_kb(enabled: bool, current_time: Optional[str]) -> types.InlineKeyb
     )
     kb.add(types.InlineKeyboardButton("✍️ Ввести своё время", callback_data="time_custom"))
     kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back"))
-
     return kb
 
-
-# ----------------- Напоминания (планировщик) -----------------
+# ----------------- Напоминания -----------------
 def reminder_job(chat_id: int):
     bot.send_message(chat_id, "⏰ Пора обновить оценки: отправь свежий Excel-файл (.xlsx).")
 
-
 def schedule_user_reminder(chat_id: int, hhmm: str):
-    """
-    Вешаем/обновляем ежедневное напоминание для пользователя.
-    """
-    # удалить старую задачу
     old_job_id = scheduled_jobs.get(chat_id)
     if old_job_id:
         try:
@@ -193,7 +180,6 @@ def schedule_user_reminder(chat_id: int, hhmm: str):
     )
     scheduled_jobs[chat_id] = job_id
 
-
 def unschedule_user_reminder(chat_id: int):
     job_id = scheduled_jobs.get(chat_id)
     if job_id:
@@ -203,11 +189,7 @@ def unschedule_user_reminder(chat_id: int):
             pass
         scheduled_jobs.pop(chat_id, None)
 
-
 def restore_jobs_from_file():
-    """
-    При перезапуске бота восстанавливаем напоминания из users.json
-    """
     global data
     data = load_data()
     for chat_id_str, u in data.items():
@@ -218,9 +200,7 @@ def restore_jobs_from_file():
         if u.get("reminder_enabled") and u.get("reminder_time"):
             schedule_user_reminder(chat_id, u["reminder_time"])
 
-
 restore_jobs_from_file()
-
 
 # ----------------- Команды -----------------
 @bot.message_handler(commands=["start"])
@@ -234,21 +214,6 @@ def start(message):
         reply_markup=menu_kb()
     )
 
-
-# ----------------- Порт-заглушка -----------------
-app = Flask(__name__)
-
-@app.get("/")
-def home():
-    return "OK", 200
-
-def run_web():
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_web, daemon=True).start()
-
-
 # ----------------- Приём файла -----------------
 @bot.message_handler(content_types=["document"])
 def on_document(message):
@@ -257,7 +222,6 @@ def on_document(message):
         bot.send_message(message.chat.id, "Нужен файл формата .xlsx 🙂", reply_markup=menu_kb())
         return
 
-    # скачать файл
     file_info = bot.get_file(message.document.file_id)
     raw = bot.download_file(file_info.file_path)
 
@@ -274,12 +238,13 @@ def on_document(message):
 
         u = get_user(message.chat.id)
 
+        # старые данные (уже строковые ключи)
         old_counter = Counter(u.get("grades_counter", {}))
         new_counter = make_counter(items)
         added = diff_new_grades(old_counter, new_counter)
 
-        # сохранить новое состояние
-        u["grades_counter"] = dict(new_counter)
+        # сохранить
+        u["grades_counter"] = dict(new_counter)  # JSON-совместимо
         u["last_overall"] = rep["overall"]
         u["last_averages"] = rep["averages"]
         save_data(data)
@@ -287,7 +252,6 @@ def on_document(message):
         msg = "✅ Файл обработан.\n"
         if added:
             msg += "\n🔔 Найдены новые оценки:\n"
-            # ограничим вывод, чтобы не было простыни
             lines = []
             for subj, grade, cnt in added[:30]:
                 suffix = f" x{cnt}" if cnt > 1 else ""
@@ -305,7 +269,6 @@ def on_document(message):
             os.remove(tmp_name)
         except Exception:
             pass
-
 
 # ----------------- Callback кнопок -----------------
 @bot.callback_query_handler(func=lambda call: True)
@@ -328,9 +291,6 @@ def on_callback(call):
             f"🏆 Лучший предмет: {best}\n"
             f"⚠ Самый слабый предмет: {worst}"
         )
-        if overall < 3.5:
-            text += "\n\n❗ Внимание: средний балл ниже 3.5"
-
         bot.send_message(chat_id, text, reply_markup=menu_kb())
         bot.answer_callback_query(call.id)
         return
@@ -355,12 +315,9 @@ def on_callback(call):
 
     if call.data == "reminders":
         enabled = bool(u.get("reminder_enabled"))
-        t = u.get("reminder_time")
-        text = "⏰ Напоминания\n"
-        text += f"Статус: {'включены ✅' if enabled else 'выключены ⛔'}\n"
-        text += f"Время: {t if t else 'не задано'}\n\n"
-        text += "Выбери время или включи/выключи:"
-        bot.send_message(chat_id, text, reply_markup=reminders_kb(enabled, t))
+        t = u.get("reminder_time") or "не задано"
+        text = f"⏰ Напоминания\nСтатус: {'включены ✅' if enabled else 'выключены ⛔'}\nВремя: {t}"
+        bot.send_message(chat_id, text, reply_markup=reminders_kb(enabled))
         bot.answer_callback_query(call.id)
         return
 
@@ -369,15 +326,12 @@ def on_callback(call):
         if not u["reminder_enabled"]:
             unschedule_user_reminder(chat_id)
         else:
-            # если время уже задано — сразу ставим
             if u.get("reminder_time"):
                 schedule_user_reminder(chat_id, u["reminder_time"])
         save_data(data)
 
         enabled = bool(u.get("reminder_enabled"))
-        t = u.get("reminder_time")
-        bot.send_message(chat_id, f"Готово ✅ Напоминания: {'включены' if enabled else 'выключены'}.\nВремя: {t or 'не задано'}",
-                         reply_markup=reminders_kb(enabled, t))
+        bot.send_message(chat_id, "Готово ✅", reply_markup=reminders_kb(enabled))
         bot.answer_callback_query(call.id)
         return
 
@@ -389,7 +343,7 @@ def on_callback(call):
         save_data(data)
 
         enabled = bool(u.get("reminder_enabled"))
-        bot.send_message(chat_id, f"✅ Время напоминания установлено: {hhmm}", reply_markup=reminders_kb(enabled, hhmm))
+        bot.send_message(chat_id, f"✅ Время установлено: {hhmm}", reply_markup=reminders_kb(enabled))
         bot.answer_callback_query(call.id)
         return
 
@@ -407,9 +361,8 @@ def on_callback(call):
 
     bot.answer_callback_query(call.id)
 
-
 # ----------------- Ввод своего времени -----------------
-@bot.message_handler(func=lambda m: True, content_types=["text"])
+@bot.message_handler(content_types=["text"])
 def on_text(message):
     chat_id = message.chat.id
     u = get_user(chat_id)
@@ -418,17 +371,12 @@ def on_text(message):
         txt = (message.text or "").strip()
         u["awaiting_time"] = False
 
-        # простая валидация HH:MM
-        ok = False
         try:
             hh, mm = txt.split(":")
-            hh_i = int(hh)
-            mm_i = int(mm)
-            ok = (0 <= hh_i <= 23) and (0 <= mm_i <= 59)
+            hh_i, mm_i = int(hh), int(mm)
+            if not (0 <= hh_i <= 23 and 0 <= mm_i <= 59):
+                raise ValueError
         except Exception:
-            ok = False
-
-        if not ok:
             save_data(data)
             bot.send_message(chat_id, "❌ Неправильный формат. Пример: 18:30")
             return
@@ -441,9 +389,8 @@ def on_text(message):
         bot.send_message(chat_id, f"✅ Время установлено: {txt}", reply_markup=menu_kb())
         return
 
-    # если человек пишет что-то обычное
     bot.send_message(chat_id, "Выбери действие кнопками 👇", reply_markup=menu_kb())
-
 
 print("Бот запущен...")
 bot.infinity_polling()
+
