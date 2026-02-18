@@ -10,6 +10,9 @@ from openpyxl import load_workbook
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import threading
+from flask import Flask
+
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -230,6 +233,20 @@ def start(message):
         "Дальше управляй через кнопки.",
         reply_markup=menu_kb()
     )
+
+
+# ----------------- Порт-заглушка -----------------
+app = Flask(__name__)
+
+@app.get("/")
+def home():
+    return "OK", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+threading.Thread(target=run_web, daemon=True).start()
 
 
 # ----------------- Приём файла -----------------
