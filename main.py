@@ -12,6 +12,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 # ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing in environment variables")
 DATA_FILE = "users.json"          # хранение данных пользователей
 DEFAULT_TZ = "Europe/Berlin"      # тебе подходит (ты в Германии)
 
