@@ -11,7 +11,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # ====== НАСТРОЙКИ ======
-BOT_TOKEN = os.environ.get("6985460150:AAEG0zrRJtXLsdAjPcx0BwqzI2MPpOEb49E")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATA_FILE = "users.json"          # хранение данных пользователей
 DEFAULT_TZ = "Europe/Berlin"      # тебе подходит (ты в Германии)
 
