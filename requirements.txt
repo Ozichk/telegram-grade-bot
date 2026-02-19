@@ -2,3 +2,4 @@ pytelegrambotapi
 apscheduler
 openpyxl
 flask
+requests
