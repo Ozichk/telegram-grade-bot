@@ -55,13 +55,6 @@ app = Flask(__name__)
 def home():
     return "OK", 200
 
-def run_web():
-    port = int(os.environ.get("PORT", PORT_DEFAULT))
-    # Важно: debug=False, reloader выключен по умолчанию
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_web, daemon=True).start()
-
 # ================== Scheduler ==================
 scheduler = BackgroundScheduler(timezone=DEFAULT_TZ)
 scheduler.start()
@@ -796,5 +789,13 @@ def run_polling_forever():
             print(f"[polling] crashed: {e}")
             time.sleep(5)
 
-print("Bot started...")
-run_polling_forever()
+def run_bot():
+    print("Telegram bot started")
+    bot.infinity_polling()
+
+threading.Thread(target=run_bot, daemon=True).start()
+
+print("Flask started")
+
+port = int(os.environ.get("PORT", 10000))
+app.run(host="0.0.0.0", port=port)
